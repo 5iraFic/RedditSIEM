@@ -42,10 +42,10 @@ glorification ("true martyr", "brave mujahideen") or incitement ("death to…").
 
 Risk thresholds
 ---------------
-  >= 0.65 → HIGH
-  >= 0.35 → MEDIUM
-  >= 0.12 → LOW
-  <  0.12 → NONE
+  >= 0.55 → HIGH
+  >= 0.30 → MEDIUM
+  >= 0.10 → LOW
+  <  0.10 → NONE
 """
 
 from __future__ import annotations
@@ -266,7 +266,11 @@ class ExtremistCommentClassifier:
                 lexical_boost = self._lexical_override(
                     sent, match.entity_type.value, signal
                 )
-                score = round(min(score + lexical_boost, 1.0), 4)
+                if lexical_boost > 0:
+                    score = round(min(score + lexical_boost, 1.0), 4)
+                    # Upgrade signal so the sentence appears in flagged_sentences
+                    if signal == COUNTER_SIGNAL:
+                        signal = EXTREMIST_SIGNAL
 
                 sentence_results.append(
                     SentenceResult(
@@ -403,11 +407,11 @@ class ExtremistCommentClassifier:
 
     @staticmethod
     def _risk_label(score: float) -> str:
-        if score >= 0.65:
+        if score >= 0.55:
             return "HIGH"
-        if score >= 0.35:
+        if score >= 0.30:
             return "MEDIUM"
-        if score >= 0.12:
+        if score >= 0.10:
             return "LOW"
         return "NONE"
 
@@ -439,9 +443,9 @@ class ExtremistCommentClassifier:
             s.sentence for s in sentence_results if s.signal_type == EXTREMIST_SIGNAL
         )
         max_compound = max(sent_extremist_counts.values(), default=0)
-        compound_bonus = min((max_compound - 1) * 0.12, 0.25)
+        compound_bonus = max(0.0, min((max_compound - 1) * 0.12, 0.25))
 
-        doc_score = round(min(base_score + compound_bonus, 1.0), 4)
+        doc_score = round(max(0.0, min(base_score + compound_bonus, 1.0)), 4)
 
         entity_labels   = list(dict.fromkeys(
             s.entity_label for s in sentence_results
