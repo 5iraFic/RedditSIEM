@@ -6,24 +6,42 @@ Islamic-extremist / jihadist comment classifier for Reddit SIEM.
 
 Combines:
   • Entity detection  (FRIENDLY / ENEMY entity lists)
-  • ABSA             (Aspect-Based Sentiment Analysis via pyabsa / DeBERTa)
-  • detoxify         (toxicity, threat, identity_attack scores)
+  • ABSA ensemble     (DeBERTa ABSA + pyabsa ATEPC, weighted vote)
+  • detoxify          (toxicity, threat, identity_attack, severe_toxicity)
 
 Quickstart
 ----------
 >>> from extremist_classifier import ExtremistCommentClassifier
 >>> clf = ExtremistCommentClassifier()
->>> result = clf.classify("We must support the mujahideen in their holy war!")
->>> print(result.label, result.score)
+>>> result = clf.classify(
+...     "We must support the mujahideen in their holy war!",
+...     comment_id="t1_abc",
+...     subreddit="r/example",
+... )
+>>> print(result.risk_label, result.doc_score)
 """
 
-from .classifier import ClassificationResult, EvidenceItem, ExtremistCommentClassifier
+__version__ = "0.1.0"
+
+from .absa import ABSAEnsemble, DeBERTaABSAAnalyzer, FallbackSentimentAnalyzer, PyABSAAnalyzer
+from .classifier import (
+    ClassificationResult,
+    ExtremistCommentClassifier,
+    SentenceResult,
+)
 from .entities import ENEMY_ENTITIES, FRIENDLY_ENTITIES, EntityMatch, EntityType
 
 __all__ = [
+    # Main interface
     "ExtremistCommentClassifier",
     "ClassificationResult",
-    "EvidenceItem",
+    "SentenceResult",
+    # ABSA backends (for standalone use)
+    "ABSAEnsemble",
+    "DeBERTaABSAAnalyzer",
+    "PyABSAAnalyzer",
+    "FallbackSentimentAnalyzer",
+    # Entity utilities
     "EntityType",
     "EntityMatch",
     "FRIENDLY_ENTITIES",

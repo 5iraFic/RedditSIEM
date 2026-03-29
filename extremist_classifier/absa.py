@@ -1,135 +1,172 @@
 """
-ABSA (Aspect-Based Sentiment Analysis) wrapper.
+ABSA (Aspect-Based Sentiment Analysis) wrappers.
 
-Strategy (in priority order):
-  1. yangheng/deberta-v3-base-absa-v1.1  – dedicated ABSA model that accepts
-     the "[aspect]:[sentence]" prompt format and returns Positive/Negative/Neutral.
-  2. pyabsa ATEPC  – auto-extracts aspects AND predicts sentiment; results are
-     matched against our entity lists by the caller.
-  3. cardiffnlp/twitter-roberta-base-sentiment-latest  – sentence-level fallback
-     when neither dedicated ABSA model is available.
+Three backends, unified interface:
 
-All methods return a uniform dict:
-  {
-    "sentiment":  "positive" | "negative" | "neutral",
-    "confidence": float,          # [0, 1]
-    "method":     str,            # which backend produced the result
-  }
+  1. DeBERTaABSAAnalyzer   – yangheng/deberta-v3-base-absa-v1.1
+       Input: "[CLS] sentence [SEP] aspect [SEP]"
+       Labels: Negative (0), Neutral (1), Positive (2)
+       Weight in ensemble: 0.6  (dedicated ABSA model, higher capacity)
+
+  2. PyABSAAnalyzer         – pyabsa ATEPC multilingual checkpoint
+       Aspect-Term Extraction + Polarity Classification.
+       The aspect (entity surface form) is injected; the model returns
+       polarity over (Negative, Neutral, Positive).
+       Weight in ensemble: 0.4
+
+  3. FallbackSentimentAnalyzer – cardiffnlp/twitter-roberta-base-sentiment-latest
+       Sentence-level only (no aspect injection); used when both primary
+       models are unavailable.
+
+ABSAEnsemble runs whatever backends are available and merges results via
+a soft weighted vote:
+  - weighted score per class = sum(weight_i * prob_i)
+  - winning class = argmax of weighted scores
+  - confidence = winning class weighted score / sum of all weighted scores
 """
 
 from __future__ import annotations
 
 import logging
-import re
 from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+# Canonical sentiment labels used everywhere
+POSITIVE = "positive"
+NEGATIVE = "negative"
+NEUTRAL  = "neutral"
+LABELS   = (NEGATIVE, NEUTRAL, POSITIVE)   # matches typical model logit order
 
-class ABSAAnalyzer:
+
+# ---------------------------------------------------------------------------
+# DeBERTa ABSA backend
+# ---------------------------------------------------------------------------
+
+class DeBERTaABSAAnalyzer:
     """
-    Lazy-loading ABSA analyzer.  Models are downloaded on first use.
+    Wraps yangheng/deberta-v3-base-absa-v1.1.
+
+    Input format expected by the model:
+        "[CLS] <sentence> [SEP] <aspect> [SEP]"
+    which the HuggingFace tokenizer builds automatically when you pass
+    text_pair=(sentence, aspect).
+
+    Label mapping (from model config):
+        0 → Negative, 1 → Neutral, 2 → Positive
     """
 
-    def __init__(self, device: Optional[str] = None):
-        import torch
+    MODEL_ID = "yangheng/deberta-v3-base-absa-v1.1"
+    LABEL_MAP = {0: NEGATIVE, 1: NEUTRAL, 2: POSITIVE}
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self._deberta_pipe = None
-        self._pyabsa_model = None
-        self._fallback_pipe = None
-        self._loaded = False
+    def __init__(self, device: str = "auto"):
+        self.device = self._resolve_device(device)
+        self._tokenizer = None
+        self._model = None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def analyze(self, sentence: str, aspect: str) -> dict:
-        """
-        Return sentiment of *sentence* toward *aspect*.
-
-        Uses the highest-priority available backend.
-        """
-        self._ensure_loaded()
-
-        if self._deberta_pipe:
-            return self._analyze_deberta(sentence, aspect)
-
-        if self._fallback_pipe:
-            return self._analyze_fallback(sentence)
-
-        return {"sentiment": "neutral", "confidence": 0.5, "method": "none"}
-
-    def extract_aspects(self, text: str) -> list[dict]:
-        """
-        Auto-extract aspects and their sentiments from *text* via pyabsa.
-
-        Returns a list of dicts:
-          {"aspect": str, "sentiment": str, "confidence": float}
-
-        Falls back to an empty list if pyabsa is unavailable.
-        """
-        self._ensure_loaded()
-
-        if not self._pyabsa_model:
-            return []
-
-        try:
-            results = self._pyabsa_model.extract_aspect(
-                inference_source=[text],
-                pred_sentiment=True,
-            )
-            aspects = []
-            if results and results[0].get("aspect"):
-                r = results[0]
-                for i, asp in enumerate(r["aspect"]):
-                    sentiment = (r.get("sentiment") or [])[i] if r.get("sentiment") else "neutral"
-                    probs = (r.get("probs") or [])[i] if r.get("probs") else [0.34, 0.33, 0.33]
-                    aspects.append(
-                        {
-                            "aspect": asp.lower().strip(),
-                            "sentiment": sentiment.lower(),
-                            "confidence": float(max(probs)),
-                        }
-                    )
-            return aspects
-        except Exception as exc:
-            logger.error("pyabsa extraction error: %s", exc)
-            return []
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _ensure_loaded(self) -> None:
-        if self._loaded:
+    def _load(self) -> None:
+        if self._model is not None:
             return
-        self._loaded = True  # set early to prevent recursive calls
-        self._load_deberta()
-        self._load_pyabsa()
-        self._load_fallback()
-
-    def _load_deberta(self) -> None:
         try:
-            from transformers import pipeline as hf_pipeline
+            import torch
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-            self._deberta_pipe = hf_pipeline(
-                "text-classification",
-                model="yangheng/deberta-v3-base-absa-v1.1",
-                device=0 if self.device == "cuda" else -1,
-                truncation=True,
-                max_length=512,
-            )
-            logger.info("DeBERTa ABSA model loaded (yangheng/deberta-v3-base-absa-v1.1)")
+            self._tokenizer = AutoTokenizer.from_pretrained(self.MODEL_ID)
+            self._model = AutoModelForSequenceClassification.from_pretrained(
+                self.MODEL_ID
+            ).to(self.device)
+            self._model.eval()
+            logger.info("DeBERTa ABSA loaded (%s)", self.MODEL_ID)
         except Exception as exc:
             logger.warning("DeBERTa ABSA not available: %s", exc)
 
-    def _load_pyabsa(self) -> None:
+    def analyze(self, sentence: str, aspect: str) -> dict | None:
+        """
+        Returns:
+          {
+            "sentiment":   "positive" | "negative" | "neutral",
+            "confidence":  float,
+            "probs":       {"negative": float, "neutral": float, "positive": float},
+            "method":      "deberta_absa",
+          }
+        Returns None if the model failed to load.
+        """
+        self._load()
+        if self._model is None:
+            return None
+
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            # Truncate sentence to keep the full aspect visible
+            sentence = sentence[:400]
+
+            enc = self._tokenizer(
+                sentence,
+                aspect,
+                return_tensors="pt",
+                truncation=True,
+                max_length=512,
+                padding=True,
+            ).to(self.device)
+
+            with torch.no_grad():
+                logits = self._model(**enc).logits
+            probs = F.softmax(logits, dim=-1)[0].cpu().tolist()
+
+            probs_dict = {
+                NEGATIVE: probs[0],
+                NEUTRAL:  probs[1],
+                POSITIVE: probs[2],
+            }
+            best_label = max(probs_dict, key=probs_dict.__getitem__)
+            return {
+                "sentiment": best_label,
+                "confidence": probs_dict[best_label],
+                "probs": probs_dict,
+                "method": "deberta_absa",
+            }
+        except Exception as exc:
+            logger.error("DeBERTa inference error: %s", exc)
+            return None
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        if device != "auto":
+            return device
+        try:
+            import torch
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except ImportError:
+            return "cpu"
+
+
+# ---------------------------------------------------------------------------
+# PyABSA backend
+# ---------------------------------------------------------------------------
+
+class PyABSAAnalyzer:
+    """
+    Wraps pyabsa's ATEPC (Aspect-Term Extraction + Polarity Classification)
+    multilingual checkpoint.
+
+    The entity surface form IS guaranteed to be present in the sentence
+    (we extracted that sentence because it contains the entity), so ATEPC
+    injection via the `aspects` parameter is always valid.
+    """
+
+    def __init__(self):
+        self._model = None
+
+    def _load(self) -> None:
+        if self._model is not None:
+            return
         try:
             from pyabsa import ATEPCCheckpoint
             from pyabsa import AspectTermExtraction as ATEPC
 
-            self._pyabsa_model = ATEPC.AspectExtractor(
+            self._model = ATEPC.AspectExtractor(
                 ATEPCCheckpoint.MULTILINGUAL,
                 auto_device=True,
             )
@@ -137,85 +174,223 @@ class ABSAAnalyzer:
         except Exception as exc:
             logger.warning("pyabsa not available: %s", exc)
 
-    def _load_fallback(self) -> None:
-        if self._deberta_pipe:
-            return  # primary model available; skip fallback
+    def analyze(self, sentence: str, aspect: str) -> dict | None:
+        """
+        Returns:
+          {
+            "sentiment":   "positive" | "negative" | "neutral",
+            "confidence":  float,
+            "probs":       {"negative": float, "neutral": float, "positive": float},
+            "method":      "pyabsa",
+          }
+        Returns None if pyabsa failed to load or the aspect was not found.
+        """
+        self._load()
+        if self._model is None:
+            return None
+
+        try:
+            results = self._model.extract_aspect(
+                inference_source=[sentence],
+                pred_sentiment=True,
+            )
+
+            if not results or not results[0].get("aspect"):
+                return None
+
+            r = results[0]
+            aspects_lower = [a.lower() for a in r["aspect"]]
+            aspect_lower  = aspect.lower()
+
+            # Find the index of our target aspect (exact or substring match)
+            idx = None
+            for i, a in enumerate(aspects_lower):
+                if aspect_lower in a or a in aspect_lower:
+                    idx = i
+                    break
+
+            if idx is None:
+                return None  # pyabsa didn't extract our entity
+
+            sentiment = (r.get("sentiment") or [])[idx].lower()
+            probs_raw = (r.get("probs") or [])[idx]
+
+            if isinstance(probs_raw, (list, tuple)) and len(probs_raw) == 3:
+                probs_dict = {
+                    NEGATIVE: float(probs_raw[0]),
+                    NEUTRAL:  float(probs_raw[1]),
+                    POSITIVE: float(probs_raw[2]),
+                }
+            else:
+                # Fallback: assign full confidence to reported label
+                probs_dict = {NEGATIVE: 0.0, NEUTRAL: 0.0, POSITIVE: 0.0}
+                if sentiment in probs_dict:
+                    probs_dict[sentiment] = 1.0
+
+            best_label = max(probs_dict, key=probs_dict.__getitem__)
+            return {
+                "sentiment":  best_label,
+                "confidence": probs_dict[best_label],
+                "probs":      probs_dict,
+                "method":     "pyabsa",
+            }
+        except Exception as exc:
+            logger.error("pyabsa inference error: %s", exc)
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Sentence-level fallback
+# ---------------------------------------------------------------------------
+
+class FallbackSentimentAnalyzer:
+    """
+    cardiffnlp/twitter-roberta-base-sentiment-latest.
+    No aspect injection; sentence-level only.
+    Used when both primary ABSA models are unavailable.
+    """
+
+    MODEL_ID = "cardiffnlp/twitter-roberta-base-sentiment-latest"
+    LABEL_MAP = {
+        "positive": POSITIVE, "pos": POSITIVE, "label_2": POSITIVE,
+        "negative": NEGATIVE, "neg": NEGATIVE, "label_0": NEGATIVE,
+        "neutral":  NEUTRAL,  "neu": NEUTRAL,  "label_1": NEUTRAL,
+    }
+
+    def __init__(self, device: str = "auto"):
+        self.device = DeBERTaABSAAnalyzer._resolve_device(device)
+        self._pipe = None
+
+    def _load(self) -> None:
+        if self._pipe is not None:
+            return
         try:
             from transformers import pipeline as hf_pipeline
 
-            self._fallback_pipe = hf_pipeline(
+            self._pipe = hf_pipeline(
                 "sentiment-analysis",
-                model="cardiffnlp/twitter-roberta-base-sentiment-latest",
+                model=self.MODEL_ID,
                 device=0 if self.device == "cuda" else -1,
                 truncation=True,
                 max_length=512,
             )
-            logger.info("Fallback sentiment model loaded (cardiffnlp/twitter-roberta)")
+            logger.info("Fallback sentiment model loaded (%s)", self.MODEL_ID)
         except Exception as exc:
             logger.warning("Fallback sentiment model not available: %s", exc)
 
-    # ------------------------------------------------------------------
-    # Backend implementations
-    # ------------------------------------------------------------------
-
-    _LABEL_MAP_DEBERTA = {
-        "positive": "positive",
-        "negative": "negative",
-        "neutral": "neutral",
-    }
-
-    def _analyze_deberta(self, sentence: str, aspect: str) -> dict:
-        """DeBERTa ABSA: input format is '[aspect]:[sentence]'."""
-        input_text = f"{aspect}:{sentence}"
+    def analyze(self, sentence: str) -> dict | None:
+        self._load()
+        if self._pipe is None:
+            return None
         try:
-            result = self._deberta_pipe(input_text)[0]
-            label = self._normalize_label(result["label"])
+            result = self._pipe(sentence)[0]
+            label = self.LABEL_MAP.get(result["label"].lower(), NEUTRAL)
+            conf  = float(result["score"])
+            probs = {NEGATIVE: 0.0, NEUTRAL: 0.0, POSITIVE: 0.0}
+            probs[label] = conf
             return {
-                "sentiment": label,
-                "confidence": float(result["score"]),
-                "method": "deberta_absa",
-            }
-        except Exception as exc:
-            logger.error("DeBERTa ABSA inference error: %s", exc)
-            # Fall through to fallback
-            if self._fallback_pipe:
-                return self._analyze_fallback(sentence)
-            return {"sentiment": "neutral", "confidence": 0.5, "method": "error"}
-
-    _LABEL_MAP_TWITTER = {
-        "positive": "positive",
-        "negative": "negative",
-        "neutral": "neutral",
-        "label_0": "negative",
-        "label_1": "neutral",
-        "label_2": "positive",
-    }
-
-    def _analyze_fallback(self, sentence: str) -> dict:
-        try:
-            result = self._fallback_pipe(sentence)[0]
-            label = self._normalize_label(result["label"])
-            return {
-                "sentiment": label,
-                "confidence": float(result["score"]),
-                "method": "twitter_roberta",
+                "sentiment":  label,
+                "confidence": conf,
+                "probs":      probs,
+                "method":     "twitter_roberta",
             }
         except Exception as exc:
             logger.error("Fallback sentiment error: %s", exc)
-            return {"sentiment": "neutral", "confidence": 0.5, "method": "error"}
+            return None
 
-    @staticmethod
-    def _normalize_label(label: str) -> str:
-        label = label.lower().strip()
-        mapping = {
-            "positive": "positive",
-            "pos": "positive",
-            "label_2": "positive",
-            "negative": "negative",
-            "neg": "negative",
-            "label_0": "negative",
-            "neutral": "neutral",
-            "neu": "neutral",
-            "label_1": "neutral",
+
+# ---------------------------------------------------------------------------
+# Ensemble
+# ---------------------------------------------------------------------------
+
+class ABSAEnsemble:
+    """
+    Runs DeBERTa ABSA and/or pyabsa and merges via soft weighted vote.
+
+    Weighted vote per class:
+        score_c = sum_i(weight_i * prob_i_c)
+    Winning class:
+        argmax(score_c)
+    Confidence:
+        score_winning / sum(score_c)   (normalised so it's always in [0,1])
+
+    Falls back to FallbackSentimentAnalyzer if neither primary model loads.
+    """
+
+    def __init__(
+        self,
+        use_deberta: bool = True,
+        use_pyabsa:  bool = True,
+        deberta_weight: float = 0.6,
+        pyabsa_weight:  float = 0.4,
+        device: str = "auto",
+    ):
+        self._deberta  = DeBERTaABSAAnalyzer(device=device) if use_deberta else None
+        self._pyabsa   = PyABSAAnalyzer()                    if use_pyabsa  else None
+        self._fallback = FallbackSentimentAnalyzer(device=device)
+        self._dw = deberta_weight
+        self._pw = pyabsa_weight
+
+    def analyze(self, sentence: str, aspect: str) -> dict:
+        """
+        Returns:
+          {
+            "sentiment":       "positive" | "negative" | "neutral",
+            "confidence":      float,
+            "agreement":       bool,          # True if both models agreed
+            "deberta_result":  dict | None,
+            "pyabsa_result":   dict | None,
+            "method":          str,
+          }
+        Never raises; always returns a valid dict.
+        """
+        deberta_r = self._deberta.analyze(sentence, aspect) if self._deberta else None
+        pyabsa_r  = self._pyabsa.analyze(sentence, aspect)  if self._pyabsa  else None
+
+        results_with_weights = [
+            (deberta_r, self._dw),
+            (pyabsa_r,  self._pw),
+        ]
+        active = [(r, w) for r, w in results_with_weights if r is not None]
+
+        if not active:
+            # Both primary models failed; use fallback
+            fb = self._fallback.analyze(sentence)
+            if fb is None:
+                fb = {"sentiment": NEUTRAL, "confidence": 0.5,
+                      "probs": {NEGATIVE: 0.33, NEUTRAL: 0.34, POSITIVE: 0.33},
+                      "method": "default"}
+            return {
+                "sentiment":      fb["sentiment"],
+                "confidence":     fb["confidence"],
+                "agreement":      False,
+                "deberta_result": None,
+                "pyabsa_result":  None,
+                "method":         fb["method"],
+            }
+
+        # Soft weighted vote over probability distributions
+        weighted = {NEGATIVE: 0.0, NEUTRAL: 0.0, POSITIVE: 0.0}
+        total_weight = sum(w for _, w in active)
+
+        for result, weight in active:
+            norm_w = weight / total_weight
+            for label in LABELS:
+                weighted[label] += norm_w * result["probs"].get(label, 0.0)
+
+        best = max(weighted, key=weighted.__getitem__)
+        total = sum(weighted.values()) or 1.0
+        confidence = weighted[best] / total
+
+        sentiments = [r["sentiment"] for r, _ in active]
+        agreement  = len(set(sentiments)) == 1
+
+        methods = "+".join(r["method"] for r, _ in active)
+        return {
+            "sentiment":      best,
+            "confidence":     round(confidence, 4),
+            "agreement":      agreement,
+            "deberta_result": deberta_r,
+            "pyabsa_result":  pyabsa_r,
+            "method":         methods,
         }
-        return mapping.get(label, "neutral")
