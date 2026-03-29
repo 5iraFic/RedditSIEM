@@ -27,10 +27,18 @@ Where:
 
   toxicity_composite = mean(toxicity, severe_toxicity, identity_attack, threat)
 
-doc_score = clip(0.65 * max(scores) + 0.35 * mean(scores), 0, 1)
+base_score    = clip(0.65 * max(scores) + 0.35 * mean(scores), 0, 1)
+compound_bonus = min((max_extremist_entities_in_one_sentence - 1) * 0.12, 0.25)
+doc_score      = clip(base_score + compound_bonus, 0, 1)
 
 Using max-weighted aggregation prevents a single COUNTER_SIGNAL (score=0.0)
 from dragging down the average when other sentences are clearly extremist.
+
+The compound bonus rewards sentences that contain multiple EXTREMIST_SIGNAL
+entities simultaneously (e.g. mujahideen + jihad + kuffar in the same sentence).
+
+A lexical override adds up to +0.30/+0.35 when ABSA misclassifies obvious
+glorification ("true martyr", "brave mujahideen") or incitement ("death to…").
 
 Risk thresholds
 ---------------
@@ -43,6 +51,8 @@ Risk thresholds
 from __future__ import annotations
 
 import logging
+import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -251,6 +261,13 @@ class ExtremistCommentClassifier:
                 score    = self._sentence_score(
                     absa_out["confidence"], tox_composite, signal
                 )
+                # Lexical override: recover score when ABSA misclassifies
+                # obvious glorification or incitement
+                lexical_boost = self._lexical_override(
+                    sent, match.entity_type.value, signal
+                )
+                score = round(min(score + lexical_boost, 1.0), 4)
+
                 sentence_results.append(
                     SentenceResult(
                         sentence               = sent,
@@ -302,6 +319,50 @@ class ExtremistCommentClassifier:
                     author     = item.get("author"),
                 ))
         return results
+
+    # ------------------------------------------------------------------
+    # Lexical patterns (fallback when ABSA is wrong)
+    # ------------------------------------------------------------------
+
+    # Words that glorify a FRIENDLY entity even if ABSA returns negative
+    _GLORIFICATION_RE = re.compile(
+        r"\b(true|brave|hero(?:es)?|great|blessed?|honored?|righteous|noble|"
+        r"legendary|proud|glorious|courageous|warrior|champion|martyr(?:dom)?|"
+        r"shaheed|honor(?:able)?|sacrifice|dedicate|devoted?|support)\b",
+        re.IGNORECASE,
+    )
+
+    # Explicit incitement / kill-commands directed at ENEMY entities
+    _INCITEMENT_RE = re.compile(
+        r"\b(kill|destroy|slaughter|execute|annihilate|death\s+to|wipe\s+out|"
+        r"behead|massacre|exterminate|eradicate|purge)\b",
+        re.IGNORECASE,
+    )
+
+    def _lexical_override(
+        self,
+        sentence: str,
+        entity_type: str,
+        signal_type: str,
+    ) -> float:
+        """
+        Return an additive score boost when lexical patterns indicate extremist
+        content that ABSA misclassified.
+
+        Main use-cases:
+          • FRIENDLY entity + COUNTER_SIGNAL but glorification keywords present
+            (e.g. "true martyr", "brave mujahideen") → ABSA returned negative
+            by mistake → boost 0.30
+          • ENEMY entity + COUNTER/WEAK but explicit incitement present
+            (e.g. "death to the kuffar") → boost 0.35
+        """
+        if entity_type == "friendly" and signal_type == COUNTER_SIGNAL:
+            if self._GLORIFICATION_RE.search(sentence):
+                return 0.30
+        if entity_type == "enemy" and signal_type in (COUNTER_SIGNAL, WEAK_SIGNAL):
+            if self._INCITEMENT_RE.search(sentence):
+                return 0.35
+        return 0.0
 
     # ------------------------------------------------------------------
     # Scoring helpers
@@ -369,7 +430,18 @@ class ExtremistCommentClassifier:
         scores    = [s.sentence_extremism_score for s in sentence_results]
         max_score = max(scores)
         avg_score = sum(scores) / len(scores)
-        doc_score = round(min(0.65 * max_score + 0.35 * avg_score, 1.0), 4)
+        base_score = 0.65 * max_score + 0.35 * avg_score
+
+        # Compound bonus: each additional EXTREMIST_SIGNAL entity in the same
+        # sentence adds +0.12 (capped at +0.25).  A sentence with 3 extremist
+        # entities is qualitatively more dangerous than one with 1.
+        sent_extremist_counts = Counter(
+            s.sentence for s in sentence_results if s.signal_type == EXTREMIST_SIGNAL
+        )
+        max_compound = max(sent_extremist_counts.values(), default=0)
+        compound_bonus = min((max_compound - 1) * 0.12, 0.25)
+
+        doc_score = round(min(base_score + compound_bonus, 1.0), 4)
 
         entity_labels   = list(dict.fromkeys(
             s.entity_label for s in sentence_results
