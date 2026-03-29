@@ -158,11 +158,14 @@ class PyABSAAnalyzer:
 
     def __init__(self):
         self._model = None
+        self._tried = False   # prevent repeated load attempts on failure
 
     def _load(self) -> None:
-        if self._model is not None:
+        if self._model is not None or self._tried:
             return
+        self._tried = True
         try:
+            # pyabsa 2.x API
             from pyabsa import ATEPCCheckpoint
             from pyabsa import AspectTermExtraction as ATEPC
 
@@ -171,6 +174,17 @@ class PyABSAAnalyzer:
                 auto_device=True,
             )
             logger.info("pyabsa ATEPC (multilingual) loaded")
+        except ImportError:
+            # pyabsa 3.x changed the public API — try alternative import
+            try:
+                from pyabsa.tasks.AspectTermExtraction import AspectExtractor
+                from pyabsa import available_checkpoints
+
+                self._model = AspectExtractor("multilingual", auto_device=True)
+                logger.info("pyabsa ATEPC loaded via 3.x API")
+            except Exception as exc2:
+                logger.warning("pyabsa not available (tried 2.x and 3.x API): %s", exc2)
+                return
         except Exception as exc:
             logger.warning("pyabsa not available: %s", exc)
 
