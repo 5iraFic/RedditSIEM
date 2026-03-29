@@ -27,14 +27,17 @@ Where:
 
   toxicity_composite = mean(toxicity, severe_toxicity, identity_attack, threat)
 
-doc_score = clip(mean(sentence_extremism_scores), 0, 1)
+doc_score = clip(0.65 * max(scores) + 0.35 * mean(scores), 0, 1)
+
+Using max-weighted aggregation prevents a single COUNTER_SIGNAL (score=0.0)
+from dragging down the average when other sentences are clearly extremist.
 
 Risk thresholds
 ---------------
-  >= 0.75 → HIGH
-  >= 0.45 → MEDIUM
-  >= 0.15 → LOW
-  <  0.15 → NONE
+  >= 0.65 → HIGH
+  >= 0.35 → MEDIUM
+  >= 0.12 → LOW
+  <  0.12 → NONE
 """
 
 from __future__ import annotations
@@ -339,11 +342,11 @@ class ExtremistCommentClassifier:
 
     @staticmethod
     def _risk_label(score: float) -> str:
-        if score >= 0.75:
+        if score >= 0.65:
             return "HIGH"
-        if score >= 0.45:
+        if score >= 0.35:
             return "MEDIUM"
-        if score >= 0.15:
+        if score >= 0.12:
             return "LOW"
         return "NONE"
 
@@ -364,7 +367,9 @@ class ExtremistCommentClassifier:
             )
 
         scores    = [s.sentence_extremism_score for s in sentence_results]
-        doc_score = round(min(sum(scores) / len(scores), 1.0), 4)
+        max_score = max(scores)
+        avg_score = sum(scores) / len(scores)
+        doc_score = round(min(0.65 * max_score + 0.35 * avg_score, 1.0), 4)
 
         entity_labels   = list(dict.fromkeys(
             s.entity_label for s in sentence_results
