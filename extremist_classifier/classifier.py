@@ -258,6 +258,15 @@ class ExtremistCommentClassifier:
             for match in matches:
                 absa_out = self._absa.analyze(sent, match.matched_text)
                 signal   = self._signal_type(match.entity_type.value, absa_out["sentiment"])
+
+                # Counter-narrative guard: when ABSA returns NEUTRAL (WEAK_SIGNAL)
+                # for a FRIENDLY entity but the sentence clearly condemns/criticises
+                # it, force COUNTER_SIGNAL so the ×0.3 multiplier doesn't fire.
+                if (signal == WEAK_SIGNAL
+                        and match.entity_type.value == "friendly"
+                        and self._COUNTER_NARRATIVE_RE.search(sent)):
+                    signal = COUNTER_SIGNAL
+
                 score    = self._sentence_score(
                     absa_out["confidence"], tox_composite, signal
                 )
@@ -328,11 +337,11 @@ class ExtremistCommentClassifier:
     # Lexical patterns (fallback when ABSA is wrong)
     # ------------------------------------------------------------------
 
-    # Words that glorify a FRIENDLY entity even if ABSA returns negative
+    # Words that glorify a FRIENDLY entity even if ABSA returns negative/neutral
     _GLORIFICATION_RE = re.compile(
         r"\b(true|brave|hero(?:es)?|great|blessed?|honored?|righteous|noble|"
         r"legendary|proud|glorious|courageous|warrior|champion|martyr(?:dom)?|"
-        r"shaheed|honor(?:able)?|sacrifice|dedicate|devoted?|support)\b",
+        r"shaheed|honor(?:able)?|sacrifice|dedicate|devoted?)\b",
         re.IGNORECASE,
     )
 
@@ -340,6 +349,21 @@ class ExtremistCommentClassifier:
     _INCITEMENT_RE = re.compile(
         r"\b(kill|destroy|slaughter|execute|annihilate|death\s+to|wipe\s+out|"
         r"behead|massacre|exterminate|eradicate|purge)\b",
+        re.IGNORECASE,
+    )
+
+    # Counter-narrative phrases: criticism/condemnation of FRIENDLY entities.
+    # When ABSA returns NEUTRAL (WEAK_SIGNAL) for these, we force COUNTER_SIGNAL
+    # to prevent a false-positive score from the ×0.3 multiplier.
+    _COUNTER_NARRATIVE_RE = re.compile(
+        r"\b(must\s+be\s+(?:stopped|defeated|destroyed|eliminated|dismantled)|"
+        r"stop(?:ped|ping)?\s+(?:isis|isil|daesh|al.qaeda|hamas|hezbollah|taliban)|"
+        r"condemn(?:s|ed|ing)?|oppose(?:d|s|ing)?|fight(?:ing)?\s+against|"
+        r"against\s+(?:isis|isil|daesh|al.qaeda|hamas|hezbollah|taliban|terrorism)|"
+        r"war\s+on\s+terror|defeat(?:ing|ed)?\s+(?:isis|isil|daesh|terrorism)|"
+        r"counter(?:ing)?\s+(?:isis|isil|terrorism|extremism)|"
+        r"brutal(?:ity)?|atrocit(?:y|ies)|horrif(?:ic|ying)|unacceptable|"
+        r"terrorism|terroris[tm]|war\s+crime(?:s)?|genocide)\b",
         re.IGNORECASE,
     )
 
